@@ -1,0 +1,39 @@
+name: Test
+on: [ push, pull_request, workflow_dispatch ]
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      -   name: Checkout sources
+          uses: actions/checkout@v6
+
+      -   name: Setup Java
+          uses: actions/setup-java@v5
+          with:
+            distribution: "graalvm"
+            java-version: 21
+
+      -   name: Setup Gradle
+          uses: gradle/actions/setup-gradle@v5
+
+      -   name: Run Docker Compose
+          run: docker compose up -d
+
+      -   name: Run tests
+          run: ./gradlew cleanTest test --stacktrace
+
+      -   name: Put all test reports into one directory
+          run: |
+            mkdir -p build/reports/tests/core
+            mkdir -p build/reports/tests/messaging
+            cp -r core/build/reports/tests/test/* build/reports/tests/core/
+            cp -r messaging/build/reports/tests/test/* build/reports/tests/messaging/
+
+      -   name: Upload test report
+          if: success() || failure()
+          uses: actions/upload-artifact@v7
+          with:
+            name: Test report
+            path: build/reports/tests/

@@ -1,0 +1,393 @@
+package com.shakster.borgar.messaging.command
+
+import com.shakster.borgar.core.BotConfig
+import com.shakster.borgar.core.collect.parallelForEach
+import com.shakster.borgar.core.data.repository.TemplateRepository
+import com.shakster.borgar.core.exception.ErrorResponseException
+import com.shakster.borgar.core.exception.FileTooLargeException
+import com.shakster.borgar.core.exception.UnreadableFileException
+import com.shakster.borgar.core.exception.UnsupportedMediaTypeException
+import com.shakster.borgar.core.io.deleteSilently
+import com.shakster.borgar.core.logger
+import com.shakster.borgar.core.util.*
+import com.shakster.borgar.messaging.BotManager
+import com.shakster.borgar.messaging.entity.DisplayedUser
+import com.shakster.borgar.messaging.entity.Guild
+import com.shakster.borgar.messaging.entity.Message
+import com.shakster.borgar.messaging.entity.User
+import com.shakster.borgar.messaging.entity.channel.MessageChannel
+import com.shakster.borgar.messaging.event.CommandEvent
+import com.shakster.borgar.messaging.event.MessageCommandEvent
+import com.shakster.borgar.messaging.event.MessageReceiveEvent
+import com.shakster.borgar.messaging.exception.*
+import com.shakster.borgar.messaging.util.checkEntityIdBelongs
+import com.shakster.borgar.messaging.util.getEntityId
+import com.shakster.borgar.messaging.util.handleBanned
+import com.shakster.borgar.messaging.util.setLowPrioritySelectedMessage
+import io.ktor.util.logging.*
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.fold
+import kotlinx.coroutines.launch
+
+suspend fun parseAndExecuteCommand(event: MessageReceiveEvent) {
+    val content = event.message.content.trim()
+    val commandPrefix = BotConfig.get().commandPrefix
+    if (!content.startsWith(commandPrefix)) return
+    handleBanned(event, "command") {
+        return
+    }
+    val commandConfigs = try {
+        parseCommands(content, event.message, event.authorId)
+    } catch (e: CommandNotFoundException) {
+        event.reply("The command **$commandPrefix${e.command}** does not exist!")
+        return
+    } catch (_: TooManyCommandsException) {
+        event.reply("You cannot chain more than ${BotConfig.get().maxChainedCommands} commands!")
+        return
+    }
+    if (commandConfigs.isEmpty()) return
+    val channel = event.getChannel()
+    val environment = channel.environment
+    val firstCommand = commandConfigs.first().command
+    if (!firstCommand.isCorrectEnvironment(environment)) return
+    val commandEvent = MessageCommandEvent(event)
+    val cancellableTyping = channel.cancellableTyping
+    val (responses, executable) = sendTypingUntilDone(channel) {
+        executeCommands(
+            commandConfigs,
+            environment,
+            commandEvent,
+        ).also { (responses, executable) ->
+            if (cancellableTyping) {
+                sendResponses(responses, executable, commandEvent, channel)
+            }
+        }
+    }
+    if (!cancellableTyping) {
+        sendResponses(responses, executable, commandEvent, channel)
+    }
+}
+
+private suspend fun <T> sendTypingUntilDone(
+    channel: MessageChannel,
+    block: suspend () -> T,
+): T = coroutineScope {
+    var sendTyping = true
+    val typingDuration = channel.manager.typingDuration
+    val typing = launch {
+        while (sendTyping) {
+            channel.sendTyping()
+            delay(typingDuration)
+        }
+    }
+    block().also {
+        sendTyping = false
+        typing.cancel()
+        channel.stopTyping()
+    }
+}
+
+suspend inline fun executeCommands(
+    commandConfigs: List<CommandConfig>,
+    environment: ChannelEnvironment,
+    event: CommandEvent,
+): Pair<List<CommandResponse>, Executable?> =
+    runCatching {
+        val executables = commandConfigs.map {
+            val (command, arguments) = it
+            val guild = event.getGuild()
+            if (!command.isCorrectEnvironment(environment)) {
+                throw IncorrectChannelEnvironmentException(command, environment)
+            }
+            if (guild != null) {
+                val requiredPermissions = command.requiredPermissions
+                val permissionHolder = guild.getMember(event.authorId) ?: guild.publicRole
+                val hasPermission = permissionHolder?.hasPermission(requiredPermissions, event.getChannel())
+                if (hasPermission == false) {
+                    throw InsufficientPermissionsException(command, requiredPermissions)
+                }
+            }
+            try {
+                command.createExecutable(arguments, event)
+            } catch (t: Throwable) {
+                throw CommandException(listOf(it), cause = t)
+            }
+        }
+        val chained = executables.reduce { executable1, executable2 ->
+            executable1 then executable2
+        }
+        val result = try {
+            chained.run()
+        } catch (t: Throwable) {
+            throw CommandException(chained.commandConfigs, cause = t)
+        }
+        if (result.isEmpty())
+            throw CommandException(chained.commandConfigs, "No command responses were returned")
+        result.forEach {
+            if (it.content.isBlank() && it.files.isEmpty())
+                throw CommandException(chained.commandConfigs, "Command response is empty")
+        }
+        result to chained
+    }.getOrElse { t ->
+        val responseContent = handleError(t, event.manager)
+        listOf(CommandResponse(responseContent)) to null
+    }
+
+suspend fun sendResponses(
+    responses: List<CommandResponse>,
+    executable: Executable?,
+    commandEvent: CommandEvent,
+    channel: MessageChannel,
+) {
+    var sendHandleResponseErrorMessage = true
+    responses.forEachIndexed { index, response ->
+        try {
+            val sent = commandEvent.reply(response)
+            if (index == responses.size - 1) {
+                setLowPrioritySelectedMessage(
+                    userId = commandEvent.authorId,
+                    channelId = channel.id,
+                    platform = commandEvent.manager.platform,
+                    message = sent,
+                )
+            }
+            runCatching {
+                executable?.onResponseSend(
+                    response,
+                    index + 1,
+                    responses.size,
+                    sent,
+                    commandEvent,
+                )
+            }.onFailure { t ->
+                logger.error("An error occurred", t)
+                if (sendHandleResponseErrorMessage) {
+                    commandEvent.reply("An error occurred!")
+                    sendHandleResponseErrorMessage = false
+                }
+            }
+        } catch (_: FileTooLargeException) {
+            commandEvent.reply("The file is too large to send!")
+        } catch (t: Throwable) {
+            logger.error("Failed to send response", t)
+            runCatching {
+                commandEvent.reply("Error sending response!")
+            }
+        } finally {
+            response.files.parallelForEach {
+                it.content.path?.deleteSilently()
+            }
+        }
+    }
+    executable?.close()
+}
+
+suspend fun formatMentions(content: String, message: CommandMessageIntersection): String {
+    if (content.isBlank()) return content
+    var stripped = content
+    runCatching {
+        stripped = message.mentionedUsers.fold(stripped) { newContent, user ->
+            val details = userDetails(user, message.getGuild())
+            newContent.replace(
+                "<@!?${user.id}>".toRegex(),
+                "@${details.effectiveName}"
+            )
+        }
+        stripped = message.mentionedChannels.fold(stripped) { newContent, channel ->
+            newContent.replace(channel.asMention, "#${channel.name}")
+        }
+        stripped = message.mentionedRoles.fold(stripped) { newContent, role ->
+            newContent.replace(role.asMention, "@${role.name}")
+        }
+    }
+    return stripped
+}
+
+private const val OUT_OF_MEMORY_ERROR_MESSAGE: String =
+    "Ran out of memory! Please try again later, or use a smaller file."
+
+fun handleError(throwable: Throwable, manager: BotManager): String {
+    val (unwrapped, commandConfigs) =
+        if (throwable is CommandException)
+            (throwable.cause ?: throwable) to throwable.commandConfigs
+        else throwable to emptyList()
+    return when (unwrapped) {
+        is ErrorResponseException -> {
+            unwrapped.cause?.let {
+                logger.error("An error occurred", it)
+            }
+            unwrapped.message
+        }
+
+        is NonChainableCommandException -> unwrapped.message
+
+        is MissingArgumentException -> unwrapped.message
+
+        is InsufficientPermissionsException ->
+            "**${unwrapped.command.nameWithPrefix}** requires permissions:\n${
+                unwrapped.requiredPermissions.joinToString(
+                    "\n"
+                ) {
+                    manager.getPermissionName(it)
+                }
+            }"
+
+        is IncorrectChannelEnvironmentException -> {
+            var message = "**${unwrapped.command.nameWithPrefix}** cannot be used in a"
+            val environmentDisplayName = unwrapped.environment.displayName.lowercase()
+            if (environmentDisplayName.startsWithVowel()) {
+                message += "n"
+            }
+            "$message $environmentDisplayName!"
+        }
+
+        is UnreadableFileException -> {
+            logger.commandError(commandConfigs, unwrapped)
+            val type = unwrapped.type
+            if (type.isBlank()) {
+                "The file could not be read!"
+            } else {
+                "The $type file could not be read!"
+            }
+        }
+
+        is UnsupportedMediaTypeException -> "The media type ${unwrapped.type} is not supported!"
+
+        is OutOfMemoryError -> {
+            logger.commandError(commandConfigs, unwrapped)
+            OUT_OF_MEMORY_ERROR_MESSAGE
+        }
+
+        else -> {
+            logger.commandError(commandConfigs, unwrapped)
+            "An error occurred!"
+        }
+    }
+}
+
+private fun Logger.commandError(commandConfigs: Collection<CommandConfig>, throwable: Throwable) {
+    if (commandConfigs.isEmpty()) {
+        error("An error occurred", throwable)
+    } else {
+        var message = "Error executing command"
+        if (commandConfigs.size > 1) {
+            message += "s"
+        }
+        message += " "
+        message += commandConfigs.joinToString(", ") {
+            it.typedForm
+        }
+        error(
+            message,
+            throwable,
+        )
+    }
+}
+
+private suspend fun userDetails(user: User, guild: Guild?): DisplayedUser =
+    guild?.getMember(user) ?: user
+
+suspend fun parseCommands(
+    messageContent: String,
+    message: Message,
+    authorId: String,
+): List<CommandConfig> {
+    val rawCommands = parseRawCommands(messageContent)
+    val maxChainedCommands = BotConfig.get().maxChainedCommands
+    if (maxChainedCommands > 0 && rawCommands.size > maxChainedCommands) {
+        throw TooManyCommandsException()
+    }
+    return rawCommands.mapIndexed { index, (commandString, rawArguments, defaultArgumentValue) ->
+        val command = COMMANDS_AND_ALIASES[commandString] ?: getCustomTemplateCommand(
+            commandString,
+            message,
+        )
+        if (command == null || (command.ownerOnly && authorId != message.manager.ownerId)) {
+            if (index > 0) {
+                throw CommandNotFoundException(commandString)
+            } else {
+                return emptyList()
+            }
+        }
+        val arguments = MessageCommandArguments(
+            rawArguments,
+            command.defaultArgumentKey,
+            defaultArgumentValue,
+            command.argumentInfo,
+            message,
+        )
+        CommandConfig(command, arguments)
+    }
+}
+
+internal fun parseRawCommands(message: String): List<RawCommandConfig> {
+    val commandPrefix = BotConfig.get().commandPrefix
+    return parseCommandStrings(message).map { commandString ->
+        val commandEndIndex = commandString.endOfWord(commandPrefix.length)
+        val command = commandString.substring(commandPrefix.length, commandEndIndex).lowercase()
+        val argumentPrefixIndexes = commandString.indicesOfPrefix(ARGUMENT_PREFIX)
+        val arguments = commandString.split(argumentPrefixIndexes)
+            .associate {
+                val argumentNameEndIndex = it.endOfWord(ARGUMENT_PREFIX.length)
+                val argumentName = it.substring(ARGUMENT_PREFIX.length, argumentNameEndIndex)
+                val argumentValue = it.substring(argumentNameEndIndex)
+                    .trim()
+                    .ifBlank { "true" } // Flag argument
+                argumentName to argumentValue
+            }
+        val defaultArgument = if (argumentPrefixIndexes.isEmpty()) {
+            commandString.substring(commandEndIndex)
+        } else {
+            commandString.substring(commandEndIndex, argumentPrefixIndexes[0])
+        }.trim()
+        RawCommandConfig(command, arguments, defaultArgument)
+    }
+}
+
+internal fun parseCommandStrings(message: String): List<String> {
+    val commandPrefix = BotConfig.get().commandPrefix
+    val commandPrefixIndexes = message.indicesOfPrefix(commandPrefix)
+    return message.split(commandPrefixIndexes).map { it.trim() }
+}
+
+private suspend fun getCustomTemplateCommand(commandName: String, message: Message): Command? {
+    val commandNameParts = commandName.split(ENTITY_ID_SEPARATOR, limit = 2)
+    val templateName = commandNameParts[0]
+    val messageEntityId = message.getEntityId()
+    val entityId = if (commandNameParts.size == 1) {
+        messageEntityId
+    } else {
+        commandNameParts[1]
+    }
+    val template = runCatching {
+        TemplateRepository.read(templateName, entityId)
+    }.getOrNull() ?: return null
+    checkEntityIdBelongs(
+        currentEnvironmentEntityId = messageEntityId,
+        toCheckEntityId = entityId,
+        targetEnvironment = template.entityEnvironment,
+        authorId = message.authorId,
+        manager = message.manager,
+    ) {
+        return null
+    }
+    return TemplateCommand(template)
+}
+
+data class CommandConfig(
+    val command: Command,
+    val arguments: CommandArguments,
+) {
+    val typedForm: String = "${BotConfig.get().commandPrefix}${command.name}" + run {
+        val argumentsTypedForm = arguments.typedForm
+        if (argumentsTypedForm.isNotBlank()) " $argumentsTypedForm"
+        else ""
+    }
+}
+
+internal data class RawCommandConfig(
+    val command: String,
+    val arguments: Map<String, String>,
+    val defaultArgument: String,
+)

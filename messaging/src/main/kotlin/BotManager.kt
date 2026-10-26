@@ -1,0 +1,58 @@
+package com.shakster.borgar.messaging
+
+import com.shakster.borgar.core.util.MessagingPlatform
+import com.shakster.borgar.messaging.command.Permission
+import com.shakster.borgar.messaging.entity.*
+import com.shakster.borgar.messaging.entity.channel.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlin.time.Duration
+
+const val BOT_STATUS: String = "fortnite battle pass"
+
+private val botManagersMutable: MutableList<BotManager> = mutableListOf()
+val BOT_MANAGERS: List<BotManager> = botManagersMutable
+
+interface BotManager {
+
+    val platform: MessagingPlatform
+    val selfId: String
+    val ownerId: String
+    val maxMessageContentLength: Int
+    val maxFileSize: Long
+    val maxFilesPerMessage: Int
+    val emojiTypedRegex: Regex
+    val typingDuration: Duration
+    val commandAutoCompleteMaxSuggestions: Int
+
+    suspend fun getSelf(): User
+
+    suspend fun getUser(id: String): User?
+
+    suspend fun getChannel(id: String): Channel?
+
+    suspend fun getGuild(id: String): Guild?
+
+    suspend fun getGroup(id: String): Group?
+
+    suspend fun getGuildCount(): Int
+
+    fun getCustomEmojis(content: String): Flow<CustomEmoji>
+
+    fun getMentionedUsers(content: String): Flow<User>
+
+    fun getMentionedChannels(content: String): Flow<Channel>
+
+    fun getMentionedRoles(content: String): Flow<Role>
+
+    fun getEmojiName(typedEmoji: String): String
+
+    fun emojiAsTyped(emoji: String): String
+
+    fun getPermissionName(permission: Permission): String
+
+    fun formatUserMention(userId: String): String
+}
+
+fun registerBotManager(botManager: BotManager) {
+    botManagersMutable += botManager
+}

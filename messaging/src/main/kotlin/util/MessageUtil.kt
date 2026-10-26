@@ -1,0 +1,377 @@
+package com.shakster.borgar.messaging.util
+
+import com.shakster.borgar.core.emoji.getEmojiUrl
+import com.shakster.borgar.core.emoji.getEmojiUrlFromShortcode
+import com.shakster.borgar.core.emoji.isEmojiUnicode
+import com.shakster.borgar.core.exception.ErrorResponseException
+import com.shakster.borgar.core.ffmpegAvailable
+import com.shakster.borgar.core.graphics.drawable.Drawable
+import com.shakster.borgar.core.graphics.drawable.ImageDrawable
+import com.shakster.borgar.core.io.DataSource
+import com.shakster.borgar.core.io.UrlInfo
+import com.shakster.borgar.core.io.head
+import com.shakster.borgar.core.io.useHttpClient
+import com.shakster.borgar.core.util.*
+import com.shakster.borgar.messaging.BotManager
+import com.shakster.borgar.messaging.command.CommandMessageIntersection
+import com.shakster.borgar.messaging.entity.Message
+import com.shakster.borgar.messaging.entity.User
+import com.shakster.borgar.messaging.entity.channel.Channel
+import com.shakster.borgar.messaging.entity.getContent
+import com.shakster.borgar.messaging.event.CommandEvent
+import io.ktor.http.*
+import kotlinx.coroutines.flow.*
+import java.net.URI
+import kotlin.math.min
+
+private const val MAX_PAST_MESSAGES_TO_CHECK: Int = 100
+
+private val NON_EMBED_HOSTS: Set<String> = setOf(
+    "raw.githubusercontent.com",
+    "cdn.stoatusercontent.com",
+    "proxy.stoatusercontent.com",
+    "external.stoatusercontent.com",
+    "cdn.revoltusercontent.com",
+    "autumn.revolt.chat",
+    "jan.revolt.chat",
+    "pbs.twimg.com",
+    "i.redd.it",
+)
+
+suspend fun CommandMessageIntersection.getUrlsExceptSelf(getGif: Boolean): List<UrlInfo> {
+    return searchExceptSelf {
+        val urls = it.getUrls(getGif)
+        urls.ifEmpty {
+            null
+        }
+    } ?: emptyList()
+}
+
+suspend fun CommandMessageIntersection.getUrls(getGif: Boolean): List<UrlInfo> = buildList {
+    addAll(
+        attachments.map { attachment ->
+            UrlInfo(attachment.url, attachment.filename)
+        }
+    )
+    val urls = content.getUrls()
+    val embedUrls = mutableListOf<String>()
+    val nonEmbedUrls = mutableListOf<String>()
+    val tenorUrls = mutableListOf<String>()
+    urls.forEach { url ->
+        if (isTenorUrl(url)) {
+            tenorUrls += url
+        } else if (URI(url).host in NON_EMBED_HOSTS) {
+            nonEmbedUrls += url
+        } else {
+            embedUrls += url
+        }
+    }
+    addAll(nonEmbedUrls.map {
+        UrlInfo(it)
+    })
+    addAll(tenorUrls.mapNotNull {
+        retrieveTenorMediaUrl(it, getGif)
+    })
+    addAll(
+        getEmbeds().mapNotNull {
+            it.getContent(getGif)
+        }
+    )
+    addAll(
+        embedUrls.mapNotNull {
+            if (isMedia(it)) {
+                UrlInfo(it)
+            } else {
+                null
+            }
+        }
+    )
+    addAll(
+        stickers.map {
+            UrlInfo(it.imageUrl)
+        }.toList()
+    )
+}
+
+suspend fun CommandMessageIntersection.getEmojiAndUrlDrawables(): Map<String, Drawable> {
+    return if (content.isBlank()) emptyMap()
+    else getEmojiDrawables() + getUrlDrawables()
+}
+
+private suspend fun CommandMessageIntersection.getEmojiDrawables(): Map<String, Drawable> {
+    return getEmojiUrls().mapValues {
+        val dataSource = DataSource.fromUrl(url = it.value)
+        ImageDrawable(dataSource)
+    }
+}
+
+private suspend fun CommandMessageIntersection.getUrlDrawables(): Map<String, Drawable> {
+    val embeds = getEmbeds().associateBy { it.url }
+    return content.getUrls()
+        .associateBy { it }
+        .mapNotNull { entry ->
+            var checkContentType = true
+            val url = embeds[entry.key]?.getContent(false)?.url
+                ?: run {
+                    val mediaType = if (ffmpegAvailable) {
+                        TenorMediaType.MP4_NORMAL
+                    } else {
+                        TenorMediaType.GIF_LARGE
+                    }
+                    retrieveTenorMediaUrl(entry.key, mediaType).also {
+                        checkContentType = false
+                    }
+                }
+                ?: entry.key
+            if (checkContentType && !isMedia(url)) {
+                return@mapNotNull null
+            }
+            val dataSource = DataSource.fromUrl(url)
+            runCatching {
+                ImageDrawable(dataSource)
+            }.map { entry.key to it }.getOrNull()
+        }.associate { it }
+}
+
+private suspend fun isMedia(url: String): Boolean {
+    val contentType = runCatching {
+        useHttpClient { client ->
+            client.head(url).contentType()
+        }
+    }.getOrNull() ?: return false
+    return contentType.match(ContentType.Image.Any)
+        || contentType.match(ContentType.Video.Any)
+        || contentType.match(ContentType.Application.Pdf)
+}
+
+suspend fun CommandMessageIntersection.getEmojiUrls(): Map<String, String> {
+    val emojiUrls = mutableMapOf<String, String>()
+
+    val customEmojis = customEmojis.toSet()
+    // Get custom emojis.
+    customEmojis.forEach {
+        emojiUrls[it.asMention] = it.imageUrl
+    }
+
+    if (manager.platform == MessagingPlatform.DISCORD) {
+        // Get undetected emojis, such as those requiring Discord nitro
+        getGuild()?.let { guild ->
+            val existingEmojis = customEmojis.map { it.name }.toSet()
+            guild.getEmojis().collect {
+                if (!existingEmojis.contains(it.name)) {
+                    val basicMention = it.asBasicMention
+                    if (content.contains(basicMention)) {
+                        emojiUrls[basicMention] = it.imageUrl
+                    }
+                }
+            }
+        }
+    }
+
+    // Get unicode emojis.
+    val codePoints = content.codePoints().toArray()
+    var i = 0
+    while (i < codePoints.size) {
+        for (j in min(codePoints.size - 1, 10 + i) downTo i) {
+            val compositeUnicodeBuilder = StringBuilder()
+            val compositeCodePoints = buildList {
+                for (k in i..j) {
+                    val codePoint = codePoints[k]
+                    val hexCodePoint = codePoint.toString(16)
+                    add(codePoint)
+                    compositeUnicodeBuilder.append(hexCodePoint).append("-")
+                }
+            }
+            compositeUnicodeBuilder.deleteCharAt(compositeUnicodeBuilder.length - 1)
+
+            val compositeUnicode = compositeUnicodeBuilder.toString()
+            if (isEmojiUnicode(compositeUnicode)) {
+                val emojiCharactersBuilder = StringBuilder()
+                compositeCodePoints.forEach(emojiCharactersBuilder::appendCodePoint)
+                emojiUrls[emojiCharactersBuilder.toString()] = getEmojiUrl(compositeUnicode)
+                i += j - i
+                break
+            }
+        }
+        i++
+    }
+
+    // Get unicode emojis from shortcodes.
+    manager.emojiTypedRegex.findAll(content).forEach {
+        val emojiName = manager.getEmojiName(it.value)
+        val emojiUrl = getEmojiUrlFromShortcode(emojiName)
+        if (emojiUrl != null) {
+            emojiUrls[emojiName] = emojiUrl
+        }
+    }
+
+    return emojiUrls
+}
+
+suspend fun <T> CommandMessageIntersection.search(find: suspend (CommandMessageIntersection) -> T?): T? {
+    return searchVisitors(
+        find,
+        CommandMessageIntersection::searchSelf,
+        CommandMessageIntersection::searchReferencedMessages,
+        CommandMessageIntersection::searchSelectedMessage,
+        CommandMessageIntersection::searchPreviousMessages,
+        CommandMessageIntersection::searchLowPrioritySelectedMessage,
+    )
+}
+
+suspend fun <T> CommandMessageIntersection.searchExceptSelf(find: suspend (CommandMessageIntersection) -> T?): T? {
+    return searchVisitors(
+        find,
+        CommandMessageIntersection::searchReferencedMessages,
+        CommandMessageIntersection::searchSelectedMessage,
+        CommandMessageIntersection::searchPreviousMessages,
+        CommandMessageIntersection::searchLowPrioritySelectedMessage,
+    )
+}
+
+suspend fun <T> CommandMessageIntersection.searchOrThrow(
+    errorMessage: String,
+    find: suspend (CommandMessageIntersection) -> T?,
+): T {
+    return search(find) ?: throw ErrorResponseException(errorMessage)
+}
+
+suspend fun <T> CommandMessageIntersection.searchExceptSelfOrThrow(
+    errorMessage: String,
+    find: suspend (CommandMessageIntersection) -> T?,
+): T {
+    return searchExceptSelf(find) ?: throw ErrorResponseException(errorMessage)
+}
+
+private suspend fun <T> CommandMessageIntersection.searchVisitors(
+    find: suspend (CommandMessageIntersection) -> T?,
+    vararg messageVisitors: suspend CommandMessageIntersection.(suspend (CommandMessageIntersection) -> T?) -> T?,
+): T? {
+    return messageVisitors.firstNotNullOfOrNull {
+        it(find)
+    }
+}
+
+private suspend fun <T> CommandMessageIntersection.searchSelf(
+    find: suspend (CommandMessageIntersection) -> T?,
+): T? {
+    return searchMessageOrForwardedMessages(find)
+}
+
+private suspend fun <T> CommandMessageIntersection.searchReferencedMessages(
+    find: suspend (CommandMessageIntersection) -> T?,
+): T? {
+    return referencedMessages
+        .map {
+            it.searchMessageOrForwardedMessages(find)
+        }
+        .firstOrNull {
+            it != null
+        }
+}
+
+private suspend fun <T> CommandMessageIntersection.searchSelectedMessage(
+    find: suspend (CommandMessageIntersection) -> T?,
+): T? {
+    return getChannel()?.let { channel ->
+        getAndExpireSelectedMessage(
+            authorId,
+            channel.id,
+            manager.platform,
+        )
+    }?.searchMessageOrForwardedMessages(find)
+}
+
+private suspend fun <T> CommandMessageIntersection.searchPreviousMessages(
+    find: suspend (CommandMessageIntersection) -> T?,
+): T? {
+    return getPreviousMessages()
+        .take(MAX_PAST_MESSAGES_TO_CHECK)
+        .map {
+            it.searchMessageOrForwardedMessages(find)
+        }
+        .firstOrNull {
+            it != null
+        }
+}
+
+private suspend fun <T> CommandMessageIntersection.searchLowPrioritySelectedMessage(
+    find: suspend (CommandMessageIntersection) -> T?,
+): T? {
+    return getChannel()?.let { channel ->
+        getAndExpireLowPrioritySelectedMessage(
+            authorId,
+            channel.id,
+            manager.platform,
+        )
+    }?.searchMessageOrForwardedMessages(find)
+}
+
+private suspend fun <T> CommandMessageIntersection.searchMessageOrForwardedMessages(
+    find: suspend (CommandMessageIntersection) -> T?,
+): T? {
+    return find(this) ?: forwardedMessages.map {
+        find(it)
+    }.firstOrNull {
+        it != null
+    }
+}
+
+suspend fun CommandEvent.getEntityId(): String {
+    return getEntityId(getChannel()) {
+        getAuthor()
+    }
+}
+
+suspend fun Message.getEntityId(): String {
+    val channel = getChannel() ?: error("Message channel not found")
+    return getEntityId(channel) {
+        getAuthor()
+    }
+}
+
+private suspend inline fun getEntityId(
+    channel: Channel,
+    authorSupplier: () -> User,
+): String {
+    val environment = channel.environment
+    return when (environment) {
+        ChannelEnvironment.GUILD -> channel.getGuild()?.id
+        ChannelEnvironment.DIRECT_MESSAGE -> authorSupplier().id
+        ChannelEnvironment.PRIVATE -> authorSupplier().id
+        ChannelEnvironment.GROUP -> channel.getGroup()?.id
+    } ?: error("Entity ID not found in environment $environment")
+}
+
+suspend inline fun checkEntityIdBelongs(
+    currentEnvironmentEntityId: String,
+    toCheckEntityId: String,
+    targetEnvironment: ChannelEnvironment,
+    authorId: String,
+    manager: BotManager,
+    onDoesNotBelong: () -> Unit,
+) {
+    if (currentEnvironmentEntityId != toCheckEntityId) {
+        when (targetEnvironment) {
+            ChannelEnvironment.GUILD -> {
+                val guild = manager.getGuild(toCheckEntityId)
+                val belongsToGuild = guild == null || guild.isMember(authorId)
+                if (!belongsToGuild) {
+                    onDoesNotBelong()
+                }
+            }
+
+            ChannelEnvironment.DIRECT_MESSAGE -> return onDoesNotBelong()
+
+            ChannelEnvironment.PRIVATE -> return onDoesNotBelong()
+
+            ChannelEnvironment.GROUP -> {
+                val group = manager.getGroup(toCheckEntityId)
+                val belongsToGroup = group == null || group.isMember(authorId)
+                if (!belongsToGroup) {
+                    onDoesNotBelong()
+                }
+            }
+        }
+    }
+}
