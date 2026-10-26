@@ -1,6 +1,5 @@
 package com.shakster.borgar.core.util
 
-import net.dv8tion.jda.api.utils.SplitUtil
 import java.net.URLEncoder
 
 val VOWELS: Set<Char> = setOf('a', 'e', 'i', 'o', 'u')
@@ -56,14 +55,25 @@ fun CharSequence.endOfWord(startIndex: Int): Int {
 fun CharSequence.splitWords(limit: Int = 0): List<String> =
     split(WHITESPACE_REGEX, limit).filter { it.isNotBlank() }
 
-fun String.splitChunks(limit: Int): List<String> = SplitUtil.split(
-    this,
-    limit,
-    true,
-    SplitUtil.Strategy.NEWLINE,
-    SplitUtil.Strategy.WHITESPACE,
-    SplitUtil.Strategy.ANYWHERE,
-)
+fun String.splitChunks(limit: Int): List<String> {
+    require(limit > 0) { "Chunk size must be positive" }
+    if (isEmpty()) return listOf(this)
+
+    val chunks = mutableListOf<String>()
+    var start = 0
+    while (start < length) {
+        var end = minOf(start + limit, length)
+        if (end < length) {
+            val newline = lastIndexOf('\n', end - 1).takeIf { it >= start }
+            val whitespace = lastIndexOfAny(charArrayOf(' ', '\t', '\r'), end - 1)
+                .takeIf { it >= start }
+            end = (newline ?: whitespace)?.plus(1) ?: end
+        }
+        chunks += substring(start, end)
+        start = end
+    }
+    return chunks
+}
 
 fun String.equalsAnyIgnoreCase(vararg toCompare: String): Boolean = toCompare.any {
     equals(it, ignoreCase = true)

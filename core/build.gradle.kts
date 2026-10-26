@@ -12,7 +12,6 @@ val twelveMonkeysVersion: String by project
 val image4jVersion: String by project
 val pdfBoxVersion: String by project
 val reflectionsVersion: String by project
-val jdaVersion: String by project
 val exposedVersion: String by project
 val postgresqlVersion: String by project
 val sqliteVersion: String by project
@@ -34,11 +33,6 @@ dependencies {
     api("com.google.guava:guava:$guavaVersion-jre")
     implementation("commons-io:commons-io:$commonsIoVersion")
     implementation("org.reflections:reflections:$reflectionsVersion")
-    // For utility classes such as SplitUtil
-    implementation("net.dv8tion:JDA:$jdaVersion") {
-        exclude(module = "opus-java")
-    }
-
     api("org.bytedeco:javacv-platform:$javacvVersion") {
         excludeJavaCpp(
             "artoolkitplus",

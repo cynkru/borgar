@@ -153,21 +153,6 @@ suspend fun CommandMessageIntersection.getEmojiUrls(): Map<String, String> {
         emojiUrls[it.asMention] = it.imageUrl
     }
 
-    if (manager.platform == MessagingPlatform.DISCORD) {
-        // Get undetected emojis, such as those requiring Discord nitro
-        getGuild()?.let { guild ->
-            val existingEmojis = customEmojis.map { it.name }.toSet()
-            guild.getEmojis().collect {
-                if (!existingEmojis.contains(it.name)) {
-                    val basicMention = it.asBasicMention
-                    if (content.contains(basicMention)) {
-                        emojiUrls[basicMention] = it.imageUrl
-                    }
-                }
-            }
-        }
-    }
-
     // Get unicode emojis.
     val codePoints = content.codePoints().toArray()
     var i = 0

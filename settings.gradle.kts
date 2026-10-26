@@ -28,7 +28,6 @@ rootProject.name = "Borgar"
 include(
     "app",
     "core",
-    "discord",
     "messaging",
     "stoat",
     "scripts",

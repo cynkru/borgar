@@ -6,7 +6,6 @@ plugins {
 base.archivesName.set("borgar")
 
 dependencies {
-    api(project(":discord"))
     api(project(":stoat"))
 
     testImplementation(kotlin("test"))

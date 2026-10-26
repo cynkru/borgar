@@ -1,6 +1,6 @@
 # Borgar
 
-A [Discord](https://discord.com) and [Stoat](https://stoat.chat) bot that provides fun image editing commands, such as image captioning.
+A [Stoat](https://stoat.chat) bot that provides fun image editing commands, such as image captioning.
 
 <!--suppress HtmlDeprecatedAttribute -->
 <div align="center">
@@ -28,9 +28,7 @@ clockwise:
 ## Prerequisites
 
 - Java 21 SDK or higher.
-- A Discord and/or Stoat Bot Token.
-   - You can get a Discord token from the [Discord Developer Portal](https://discord.com/developers/applications) or a
-     Stoat token from the "My Bots" section of the [Stoat](https://stoat.chat/app) settings.
+- A Stoat bot token, available from the "My Bots" section of the [Stoat](https://stoat.chat/app) settings.
 
 ## Getting Borgar
 
@@ -44,14 +42,9 @@ the [Actions page](https://github.com/shaksternano/borgar/actions/workflows/buil
 1. Run Borgar with `java -jar borgar-X.X.X.jar`.
    - Replace `X.X.X` with the version number of the JAR file you downloaded.
 2. Running the program for the first time should create a `config.json` file and then exit.
-3. Add your Discord and/or Stoat bot token to the `config.json` file and run the program again.
+3. Add your Stoat bot token to the `config.json` file and run the program again.
 
 ## Required permissions
-
-### Discord
-
-<!--suppress CheckImageSize -->
-<img src="images/discord_required_permissions.png" alt="Discord required permissions" width=500/>
 
 ### Stoat
 

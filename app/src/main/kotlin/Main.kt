@@ -6,7 +6,6 @@ import com.shakster.borgar.core.BotConfig
 import com.shakster.borgar.core.START_TIME
 import com.shakster.borgar.core.initCore
 import com.shakster.borgar.core.logger
-import com.shakster.borgar.discord.initDiscord
 import com.shakster.borgar.messaging.initMessaging
 import com.shakster.borgar.stoat.initStoat
 import java.text.DecimalFormat
@@ -17,18 +16,12 @@ suspend fun main() {
     logger.info("Starting...")
     initCore()
     initMessaging()
-    val discordToken = BotConfig.get().discord.token
     val stoatToken = BotConfig.get().stoat.token
-    if (discordToken.isBlank() && stoatToken.isBlank()) {
-        logger.error("No bot tokens found")
+    if (stoatToken.isBlank()) {
+        logger.error("No Stoat token found")
         return
     }
-    if (discordToken.isNotBlank()) {
-        initDiscord(discordToken)
-    }
-    if (stoatToken.isNotBlank()) {
-        initStoat(stoatToken)
-    }
+    initStoat(stoatToken)
     val time = TimeSource.Monotonic.markNow()
     val timeTaken = time - START_TIME
     val seconds = timeTaken.toDouble(DurationUnit.SECONDS)

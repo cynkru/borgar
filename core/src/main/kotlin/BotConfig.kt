@@ -10,7 +10,6 @@ import kotlin.io.path.*
 
 @Serializable
 data class BotConfig(
-    val discord: DiscordConfig = DiscordConfig(),
     val stoat: StoatConfig = StoatConfig(),
     val commandPrefix: String = "%",
     val maxChainedCommands: Int = 10,
@@ -20,12 +19,6 @@ data class BotConfig(
     val derpibooru: DerpibooruConfig = DerpibooruConfig(),
     val ffmpeg: FFmpegConfig = FFmpegConfig(),
 ) {
-
-    @Serializable
-    data class DiscordConfig(
-        val token: String = "",
-        val logChannelId: String = "",
-    )
 
     @Serializable
     data class StoatConfig(
